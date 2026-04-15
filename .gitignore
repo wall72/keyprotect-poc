@@ -1,0 +1,59 @@
+# 빌드 결과물
+bin/
+obj/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# 오브젝트 파일
+*.o
+*.obj
+*.a
+*.lib
+
+# 임시 파일
+*.tmp
+*.temp
+*~
+
+# IDE/Editor 파일
+.vscode/
+.vs/
+*.suo
+*.user
+*.sln.docstates
+
+# Windows 시스템 파일
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# 로그 파일
+*.log
+
+# 컴파일러 생성 파일
+*.pdb
+*.idb
+*.ilk
+
+# 디버그 파일
+*.dSYM/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+
+# Make
+.deps/
+.libs/
+
+# 백업 파일
+*.bak
+*.backup
+*.orig
+
+# Doxygen 파일
+doc/
