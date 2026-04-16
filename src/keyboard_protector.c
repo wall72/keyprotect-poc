@@ -1,8 +1,10 @@
 #include "keyboard_protector.h"
+#include <ctype.h>
 #include <string.h>
 
 #define MAX_ALLOWED_PROCESSES 100
 #define KEYPROTECTOR_INJECTED_TAG ((ULONG_PTR)0x4B50524FUL)
+#define CONFIG_SECTION_BUFFER_SIZE 8192
 
 #if defined(DEBUG)
 #define HOOK_DEBUG_LOG(...) printf(__VA_ARGS__)
@@ -26,6 +28,79 @@ static DWORD g_cachedForegroundProcessId = 0;
 static BOOL g_cachedProcessAllowed = FALSE;
 static BOOL g_hasForegroundDecisionCache = FALSE;
 static FILE* g_keyLogFile = NULL;
+static KeyProtectorStatus g_runtimeStatus = KEYPROTECTOR_STATUS_OK;
+
+static int GetStatusSeverity(KeyProtectorStatus status) {
+    switch (status) {
+        case KEYPROTECTOR_STATUS_OK:
+            return 0;
+        case KEYPROTECTOR_STATUS_CONFIG_NOT_FOUND:
+        case KEYPROTECTOR_STATUS_CONFIG_SECTION_MISSING:
+        case KEYPROTECTOR_STATUS_CONFIG_EMPTY_ALLOWLIST:
+        case KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY:
+        case KEYPROTECTOR_STATUS_PROCESS_LOOKUP_FAILED:
+        case KEYPROTECTOR_STATUS_LOG_OPEN_FAILED:
+            return 1;
+        case KEYPROTECTOR_STATUS_HOOK_INSTALL_FAILED:
+        case KEYPROTECTOR_STATUS_MESSAGE_LOOP_FAILED:
+            return 2;
+        default:
+            return 1;
+    }
+}
+
+static void UpdateRuntimeStatus(KeyProtectorStatus status) {
+    if (status == KEYPROTECTOR_STATUS_OK) {
+        return;
+    }
+
+    if (GetStatusSeverity(status) >= GetStatusSeverity(g_runtimeStatus)) {
+        g_runtimeStatus = status;
+    }
+}
+
+const char* KeyProtectorStatusToString(KeyProtectorStatus status) {
+    switch (status) {
+        case KEYPROTECTOR_STATUS_OK:
+            return "ok";
+        case KEYPROTECTOR_STATUS_CONFIG_NOT_FOUND:
+            return "config-not-found";
+        case KEYPROTECTOR_STATUS_CONFIG_SECTION_MISSING:
+            return "config-section-missing";
+        case KEYPROTECTOR_STATUS_CONFIG_EMPTY_ALLOWLIST:
+            return "config-empty-allowlist";
+        case KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY:
+            return "config-invalid-entry";
+        case KEYPROTECTOR_STATUS_PROCESS_LOOKUP_FAILED:
+            return "process-lookup-failed";
+        case KEYPROTECTOR_STATUS_LOG_OPEN_FAILED:
+            return "log-open-failed";
+        case KEYPROTECTOR_STATUS_HOOK_INSTALL_FAILED:
+            return "hook-install-failed";
+        case KEYPROTECTOR_STATUS_MESSAGE_LOOP_FAILED:
+            return "message-loop-failed";
+        default:
+            return "unknown";
+    }
+}
+
+BOOL IsFatalStatus(KeyProtectorStatus status) {
+    return status == KEYPROTECTOR_STATUS_HOOK_INSTALL_FAILED ||
+           status == KEYPROTECTOR_STATUS_MESSAGE_LOOP_FAILED;
+}
+
+KeyProtectorStatus GetRuntimeStatus(void) {
+    return g_runtimeStatus;
+}
+
+void RequestShutdown(void) {
+    if (!g_running) {
+        return;
+    }
+
+    g_running = FALSE;
+    PostQuitMessage(0);
+}
 
 static void WriteKeyLog(const char* action, DWORD vkCode, const char* processName, BOOL isAllowed) {
     if (g_keyLogFile == NULL || action == NULL) {
@@ -88,6 +163,49 @@ static BOOL IsBypassToggleKey(const KBDLLHOOKSTRUCT* pKbdStruct) {
 
 static BOOL ShouldFailOpen(void) {
     return g_allowedProcessCount == 0;
+}
+
+static void TrimWhitespace(char* text) {
+    char* start = text;
+    char* end = NULL;
+    size_t length = 0;
+
+    if (text == NULL) {
+        return;
+    }
+
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        start++;
+    }
+
+    if (start != text) {
+        memmove(text, start, strlen(start) + 1);
+    }
+
+    length = strlen(text);
+    if (length == 0) {
+        return;
+    }
+
+    end = text + length - 1;
+    while (end >= text && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
+    }
+}
+
+static void TrimMatchingQuotes(char* text) {
+    size_t length = 0;
+
+    if (text == NULL) {
+        return;
+    }
+
+    length = strlen(text);
+    if (length >= 2 && text[0] == '"' && text[length - 1] == '"') {
+        memmove(text, text + 1, length - 2);
+        text[length - 2] = '\0';
+    }
 }
 
 BOOL GetCurrentProcessName(char* processName, DWORD bufferSize) {
@@ -184,10 +302,14 @@ static BOOL TryGetForegroundProcessAllowance(BOOL* isAllowed) {
     return TRUE;
 }
 
-BOOL LoadAllowedProcessesFromIni(const char* iniFilePath) {
+KeyProtectorStatus LoadAllowedProcessesFromIni(const char* iniFilePath) {
+    char configPath[MAX_PATH] = {0};
+    char sectionBuffer[CONFIG_SECTION_BUFFER_SIZE] = {0};
+    KeyProtectorStatus status = KEYPROTECTOR_STATUS_OK;
+    int count = 0;
+
     FreeAllowedProcesses();
 
-    char configPath[MAX_PATH] = {0};
     if (iniFilePath == NULL || iniFilePath[0] == '\0') {
         GetModuleFileNameA(NULL, configPath, MAX_PATH);
         char* lastSlash = strrchr(configPath, '\\');
@@ -201,49 +323,112 @@ BOOL LoadAllowedProcessesFromIni(const char* iniFilePath) {
 
     printf("[config] Loading INI file: %s\n", configPath);
 
-    DWORD fileAttr = GetFileAttributesA(configPath);
-    if (fileAttr == INVALID_FILE_ATTRIBUTES) {
+    if (GetFileAttributesA(configPath) == INVALID_FILE_ATTRIBUTES) {
         fprintf(stderr, "[warning] INI file not found: %s\n", configPath);
         fprintf(stderr, "[safety] Blocking is disabled until a valid allowlist is configured.\n");
-        return FALSE;
+        return KEYPROTECTOR_STATUS_CONFIG_NOT_FOUND;
     }
 
-    char buffer[MAX_PATH] = {0};
-    int count = 0;
+    DWORD sectionLength = GetPrivateProfileSectionA(
+        "AllowedProcesses",
+        sectionBuffer,
+        CONFIG_SECTION_BUFFER_SIZE,
+        configPath
+    );
 
-    for (int i = 1; i <= MAX_ALLOWED_PROCESSES; i++) {
-        char keyName[32] = {0};
-        sprintf_s(keyName, sizeof(keyName), "Process%d", i);
+    if (sectionLength == 0) {
+        fprintf(stderr, "[warning] [AllowedProcesses] section is missing or empty in %s\n", configPath);
+        fprintf(stderr, "[safety] Blocking is disabled until a valid allowlist is configured.\n");
+        return KEYPROTECTOR_STATUS_CONFIG_SECTION_MISSING;
+    }
 
-        DWORD result = GetPrivateProfileStringA(
-            "AllowedProcesses",
-            keyName,
-            "",
-            buffer,
-            MAX_PATH,
-            configPath
-        );
+    if (sectionLength >= CONFIG_SECTION_BUFFER_SIZE - 2) {
+        fprintf(stderr, "[warning] [AllowedProcesses] section was truncated while loading %s\n", configPath);
+        status = KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY;
+    }
 
-        if (result > 0 && buffer[0] != '\0') {
-            strcpy_s(g_allowedProcesses[count], MAX_PATH, buffer);
-            count++;
-            printf("[config] Allowed process: %s\n", buffer);
-        } else {
+    for (char* entry = sectionBuffer; *entry != '\0'; entry += strlen(entry) + 1) {
+        char* equals = strchr(entry, '=');
+        char normalizedProcessName[MAX_PATH] = {0};
+        BOOL isDuplicate = FALSE;
+
+        if (equals == NULL) {
+            fprintf(stderr, "[warning] Invalid config entry ignored: %s\n", entry);
+            status = KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY;
+            continue;
+        }
+
+        strcpy_s(normalizedProcessName, MAX_PATH, equals + 1);
+        TrimWhitespace(normalizedProcessName);
+        TrimMatchingQuotes(normalizedProcessName);
+        TrimWhitespace(normalizedProcessName);
+
+        if (normalizedProcessName[0] == '\0') {
+            fprintf(stderr, "[warning] Empty process name ignored for key: %.*s\n", (int)(equals - entry), entry);
+            status = KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY;
+            continue;
+        }
+
+        char* baseName = PathFindFileNameA(normalizedProcessName);
+        if (baseName != normalizedProcessName && baseName[0] != '\0') {
+            memmove(normalizedProcessName, baseName, strlen(baseName) + 1);
+        }
+
+        TrimWhitespace(normalizedProcessName);
+        TrimMatchingQuotes(normalizedProcessName);
+        TrimWhitespace(normalizedProcessName);
+
+        if (normalizedProcessName[0] == '\0' ||
+            strchr(normalizedProcessName, '\\') != NULL ||
+            strchr(normalizedProcessName, '/') != NULL ||
+            strchr(normalizedProcessName, ':') != NULL) {
+            fprintf(stderr, "[warning] Unsupported process name ignored: %s\n", equals + 1);
+            status = KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY;
+            continue;
+        }
+
+        for (int i = 0; i < count; i++) {
+            if (_stricmp(normalizedProcessName, g_allowedProcesses[i]) == 0) {
+                isDuplicate = TRUE;
+                break;
+            }
+        }
+
+        if (isDuplicate) {
+            fprintf(stderr, "[warning] Duplicate process entry ignored: %s\n", normalizedProcessName);
+            status = KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY;
+            continue;
+        }
+
+        if (count >= MAX_ALLOWED_PROCESSES) {
+            fprintf(stderr, "[warning] Maximum allowlist size reached. Remaining entries were ignored.\n");
+            status = KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY;
             break;
         }
+
+        strcpy_s(g_allowedProcesses[count], MAX_PATH, normalizedProcessName);
+        count++;
+        printf("[config] Allowed process: %s\n", normalizedProcessName);
     }
 
     g_allowedProcessCount = count;
     g_loggedEmptyAllowlist = FALSE;
 
     if (count == 0) {
-        fprintf(stderr, "[warning] No allowed process was configured in %s\n", configPath);
+        if (status == KEYPROTECTOR_STATUS_OK) {
+            status = KEYPROTECTOR_STATUS_CONFIG_EMPTY_ALLOWLIST;
+        }
+        fprintf(stderr, "[warning] No valid allowed process was configured in %s\n", configPath);
         fprintf(stderr, "[safety] Blocking is disabled until a valid allowlist is configured.\n");
-        return FALSE;
+        return status;
     }
 
     printf("[config] Loaded %d allowed process entries\n", count);
-    return TRUE;
+    if (status == KEYPROTECTOR_STATUS_CONFIG_INVALID_ENTRY) {
+        fprintf(stderr, "[warning] Some config entries were ignored during validation.\n");
+    }
+
+    return status;
 }
 
 void FreeAllowedProcesses(void) {
@@ -303,8 +488,7 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     }
 
     if (pKbdStruct->vkCode == VK_ESCAPE) {
-        g_running = FALSE;
-        PostQuitMessage(0);
+        RequestShutdown();
         return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
     }
 
@@ -318,79 +502,105 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     }
 
     if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
-        unsigned int original_keycode = (unsigned int)pKbdStruct->vkCode;
+        unsigned int originalKeycode = (unsigned int)pKbdStruct->vkCode;
         unsigned int salt = GetTickCount();
-        unsigned int encrypted_keycode = encrypt_keycode_with_salt(original_keycode, salt);
+        unsigned int encryptedKeycode = encrypt_keycode_with_salt(originalKeycode, salt);
         char processName[MAX_PATH] = {0};
         BOOL gotProcessName = GetCurrentProcessName(processName, MAX_PATH);
+        BOOL isAllowed = FALSE;
 
-        if (original_keycode < 256) {
-            g_keySalt[original_keycode] = salt;
-            g_encryptedKeycode[original_keycode] = encrypted_keycode;
-            g_forwardedKeyDown[original_keycode] = FALSE;
+        if (originalKeycode < 256) {
+            g_keySalt[originalKeycode] = salt;
+            g_encryptedKeycode[originalKeycode] = encryptedKeycode;
+            g_forwardedKeyDown[originalKeycode] = FALSE;
         }
 
-        BOOL isAllowed = FALSE;
         if (!TryGetForegroundProcessAllowance(&isAllowed)) {
+            UpdateRuntimeStatus(KEYPROTECTOR_STATUS_PROCESS_LOOKUP_FAILED);
             g_loggedProcessLookupFailure = TRUE;
-            WriteKeyLog("KEYDOWN", original_keycode, gotProcessName ? processName : NULL, FALSE);
-            ResetTrackedKeyState(original_keycode);
+            WriteKeyLog("KEYDOWN", originalKeycode, gotProcessName ? processName : NULL, FALSE);
+            ResetTrackedKeyState(originalKeycode);
             return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
         }
 
         g_loggedProcessLookupFailure = FALSE;
-        WriteKeyLog("KEYDOWN", original_keycode, gotProcessName ? processName : NULL, isAllowed);
+        WriteKeyLog("KEYDOWN", originalKeycode, gotProcessName ? processName : NULL, isAllowed);
 
         if (!isAllowed) {
-            ResetTrackedKeyState(original_keycode);
+            ResetTrackedKeyState(originalKeycode);
             return 1;
         }
 
-        unsigned int decrypted_keycode = decrypt_keycode_with_salt(encrypted_keycode, salt);
-
-        if (!SendDecryptedKey(decrypted_keycode, TRUE)) {
-            ResetTrackedKeyState(original_keycode);
+        if (!SendDecryptedKey(decrypt_keycode_with_salt(encryptedKeycode, salt), TRUE)) {
+            ResetTrackedKeyState(originalKeycode);
             return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
         }
 
-        if (original_keycode < 256) {
-            g_forwardedKeyDown[original_keycode] = TRUE;
+        if (originalKeycode < 256) {
+            g_forwardedKeyDown[originalKeycode] = TRUE;
         }
 
         return 1;
     }
 
     if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
-        unsigned int original_keycode = (unsigned int)pKbdStruct->vkCode;
+        unsigned int originalKeycode = (unsigned int)pKbdStruct->vkCode;
         char processName[MAX_PATH] = {0};
         BOOL gotProcessName = GetCurrentProcessName(processName, MAX_PATH);
-        WriteKeyLog("KEYUP", original_keycode, gotProcessName ? processName : NULL, TRUE);
+        BOOL isAllowed = FALSE;
 
-        if (original_keycode < 256 && g_forwardedKeyDown[original_keycode] && g_keySalt[original_keycode] != 0) {
-            unsigned int decrypted_keycode = decrypt_keycode_with_salt(
-                g_encryptedKeycode[original_keycode],
-                g_keySalt[original_keycode]
-            );
+        if (!TryGetForegroundProcessAllowance(&isAllowed)) {
+            UpdateRuntimeStatus(KEYPROTECTOR_STATUS_PROCESS_LOOKUP_FAILED);
+            g_loggedProcessLookupFailure = TRUE;
+            WriteKeyLog("KEYUP", originalKeycode, gotProcessName ? processName : NULL, FALSE);
+            ResetTrackedKeyState(originalKeycode);
+            return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+        }
 
-            if (!SendDecryptedKey(decrypted_keycode, FALSE)) {
-                ResetTrackedKeyState(original_keycode);
-                return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
-            }
+        g_loggedProcessLookupFailure = FALSE;
+        WriteKeyLog("KEYUP", originalKeycode, gotProcessName ? processName : NULL, isAllowed);
 
-            ResetTrackedKeyState(original_keycode);
+        if (!isAllowed) {
+            ResetTrackedKeyState(originalKeycode);
             return 1;
         }
 
-        ResetTrackedKeyState(original_keycode);
+        if (originalKeycode < 256 && g_forwardedKeyDown[originalKeycode] && g_keySalt[originalKeycode] != 0) {
+            unsigned int decryptedKeycode = decrypt_keycode_with_salt(
+                g_encryptedKeycode[originalKeycode],
+                g_keySalt[originalKeycode]
+            );
+
+            if (!SendDecryptedKey(decryptedKeycode, FALSE)) {
+                ResetTrackedKeyState(originalKeycode);
+                return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
+            }
+
+            ResetTrackedKeyState(originalKeycode);
+            return 1;
+        }
+
+        ResetTrackedKeyState(originalKeycode);
         return 1;
     }
 
     return CallNextHookEx(g_keyboardHook, nCode, wParam, lParam);
 }
 
-void SetHook(void) {
+KeyProtectorStatus SetHook(void) {
     BOOL isAdmin = FALSE;
     char logPath[MAX_PATH] = {0};
+    KeyProtectorStatus configStatus = KEYPROTECTOR_STATUS_OK;
+
+    g_running = TRUE;
+    g_bypassMode = FALSE;
+    g_loggedEmptyAllowlist = FALSE;
+    g_loggedProcessLookupFailure = FALSE;
+    g_cachedForegroundWindow = NULL;
+    g_cachedForegroundProcessId = 0;
+    g_cachedProcessAllowed = FALSE;
+    g_hasForegroundDecisionCache = FALSE;
+    g_runtimeStatus = KEYPROTECTOR_STATUS_OK;
 
     OSVERSIONINFO osvi;
     ZeroMemory(&osvi, sizeof(OSVERSIONINFO));
@@ -414,6 +624,21 @@ void SetHook(void) {
         }
     }
 
+    configStatus = LoadAllowedProcessesFromIni(NULL);
+    UpdateRuntimeStatus(configStatus);
+
+    GetModuleFileNameA(NULL, logPath, MAX_PATH);
+    char* lastSlash = strrchr(logPath, '\\');
+    if (lastSlash != NULL) {
+        *(lastSlash + 1) = '\0';
+    }
+    strcat_s(logPath, MAX_PATH, "keylog.txt");
+    g_keyLogFile = fopen(logPath, "a");
+    if (g_keyLogFile == NULL) {
+        fprintf(stderr, "[warning] Failed to open key log file: %s\n", logPath);
+        UpdateRuntimeStatus(KEYPROTECTOR_STATUS_LOG_OPEN_FAILED);
+    }
+
     g_keyboardHook = SetWindowsHookEx(
         WH_KEYBOARD_LL,
         LowLevelKeyboardProc,
@@ -427,21 +652,12 @@ void SetHook(void) {
         if (error == ERROR_ACCESS_DENIED) {
             fprintf(stderr, "[warning] Administrator privileges may be required.\n");
         }
-        exit(1);
+        UpdateRuntimeStatus(KEYPROTECTOR_STATUS_HOOK_INSTALL_FAILED);
+        UnsetHook();
+        return KEYPROTECTOR_STATUS_HOOK_INSTALL_FAILED;
     }
 
-    LoadAllowedProcessesFromIni(NULL);
-
-    GetModuleFileNameA(NULL, logPath, MAX_PATH);
-    char* lastSlash = strrchr(logPath, '\\');
-    if (lastSlash != NULL) {
-        *(lastSlash + 1) = '\0';
-    }
-    strcat_s(logPath, MAX_PATH, "keylog.txt");
-    g_keyLogFile = fopen(logPath, "a");
-    if (g_keyLogFile == NULL) {
-        fprintf(stderr, "[warning] Failed to open key log file: %s\n", logPath);
-    } else {
+    if (g_keyLogFile != NULL) {
         fprintf(g_keyLogFile, "===== Keyboard session started =====\n");
         fflush(g_keyLogFile);
         printf("[info] Key logging file: %s\n", logPath);
@@ -451,9 +667,14 @@ void SetHook(void) {
     if (isAdmin) {
         printf("[info] Running with administrator privileges.\n");
     }
+    if (configStatus != KEYPROTECTOR_STATUS_OK) {
+        printf("[info] Startup completed with degraded mode: %s\n", KeyProtectorStatusToString(configStatus));
+    }
     printf("---------------------------------------------------------\n");
     printf("Esc: exit program\n");
     printf("Ctrl+Alt+Shift+Pause: toggle emergency bypass\n\n");
+
+    return GetRuntimeStatus();
 }
 
 void UnsetHook(void) {
@@ -471,6 +692,9 @@ void UnsetHook(void) {
     g_cachedForegroundProcessId = 0;
     g_cachedProcessAllowed = FALSE;
     g_hasForegroundDecisionCache = FALSE;
+    g_bypassMode = FALSE;
+    g_loggedEmptyAllowlist = FALSE;
+    g_loggedProcessLookupFailure = FALSE;
 
     if (g_keyLogFile != NULL) {
         fprintf(g_keyLogFile, "===== Keyboard session ended =====\n");
