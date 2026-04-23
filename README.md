@@ -91,9 +91,19 @@ keyprotect-poc/
 +- src/
 |  +- main.c
 |  +- keyboard_protector.c
+|  +- config_manager.c
+|  +- process_filter.c
+|  +- input_forwarder.c
+|  +- key_logger.c
 |  \- crypto_keycode.c
 +- include/
-|  \- keyboard_protector.h
+|  +- keyboard_protector.h
+|  +- config_manager.h
+|  +- process_filter.h
+|  +- input_forwarder.h
+|  \- key_logger.h
++- docs/
+|  \- manual-test-checklist.md
 +- config.ini
 +- Makefile
 \- README.md
